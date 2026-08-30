@@ -14,7 +14,7 @@ from flask import Flask
 import threading
 
 # ============ CẤU HÌNH ============
-BOT_TOKEN = "THAY_BOT_TOKEN_O_DAY"
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "THAY_BOT_TOKEN_O_DAY")
 SESSION_FILE = "fb_session.pkl"
 
 # ============ LOGGING ============
