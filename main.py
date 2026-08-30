@@ -44,28 +44,32 @@ STATE = BotState()
 def get_driver():
     if STATE.driver is not None:
         return STATE.driver
-    display = Display(visible=0, size=(1280, 720))
-    display.start()
-    opts = uc.ChromeOptions()
-    opts.add_argument("--window-size=1280,720")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--disable-gpu")
-    opts.add_argument("--disable-blink-features=AutomationControlled")
-    opts.add_argument("--no-first-run")
-    opts.add_argument("--no-default-browser-check")
-    opts.add_argument("--disable-notifications")
-    opts.add_argument("--disable-popup-blocking")
-    driver = uc.Chrome(options=opts, user_data_dir=STATE.session_dir)
-    driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
-        "source": """
-        Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-        Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
-        Object.defineProperty(navigator, 'languages', {get: () => ['vi-VN', 'vi', 'en-US', 'en']});
-        """
-    })
-    STATE.driver = driver
-    return driver
+    try:
+        display = Display(visible=0, size=(1280, 720))
+        display.start()
+        opts = uc.ChromeOptions()
+        opts.add_argument("--window-size=1280,720")
+        opts.add_argument("--no-sandbox")
+        opts.add_argument("--disable-dev-shm-usage")
+        opts.add_argument("--disable-gpu")
+        opts.add_argument("--disable-blink-features=AutomationControlled")
+        opts.add_argument("--no-first-run")
+        opts.add_argument("--no-default-browser-check")
+        opts.add_argument("--disable-notifications")
+        opts.add_argument("--disable-popup-blocking")
+        driver = uc.Chrome(options=opts, user_data_dir=STATE.session_dir)
+        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+            "source": """
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+            Object.defineProperty(navigator, 'languages', {get: () => ['vi-VN', 'vi', 'en-US', 'en']});
+            """
+        })
+        STATE.driver = driver
+        return driver
+    except Exception as e:
+        logger.error(f"Lỗi khởi động driver: {e}")
+        raise RuntimeError(f"Không thể khởi động trình duyệt: {e}")
 
 # ============ DETECT LOCK TYPE ============
 def detect_lock_type(driver):
@@ -265,33 +269,38 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             STATE.fb_contact = text.strip()
             STATE.waiting_for = "ask_password"
             await update.message.reply_text("Đã nhận. Gửi mật khẩu Facebook.")
-        # Nhận mật khẩu
+        # Nhận mật khẩu và bắt đầu
         elif STATE.waiting_for == "ask_password":
             STATE.fb_password = text.strip()
             STATE.waiting_for = None
             await update.message.reply_text("Đang khởi động trình duyệt...")
-            driver = get_driver()
-            goto_login_recovery(driver)
-            fill_contact(driver, STATE.fb_contact)
-            time.sleep(2)
-            STATE.lock_type = detect_lock_type(driver)
-            await update.message.reply_text(f"Phát hiện trạng thái: {STATE.lock_type}")
-            if "login" in driver.current_url:
-                try:
-                    fill_password(driver, STATE.fb_password)
-                except:
-                    pass
-            if STATE.lock_type in ["checkpoint", "temp_blocked", "suspended"]:
-                handle_checkpoint_flow(driver)
-            elif STATE.lock_type == "forgot_password":
-                handle_forgot_password_flow(driver)
-            elif STATE.lock_type == "hacked_recovery":
-                handle_hacked_flow(driver)
-            elif STATE.lock_type in ["disabled", "perm_disabled"]:
-                handle_disabled_flow(driver)
-            else:
-                handle_forgot_password_flow(driver)
-            await update.message.reply_text(f"Đang ở bước: {STATE.current_step} | Chờ: {STATE.waiting_for}")
+            try:
+                driver = get_driver()
+                goto_login_recovery(driver)
+                fill_contact(driver, STATE.fb_contact)
+                time.sleep(2)
+                STATE.lock_type = detect_lock_type(driver)
+                await update.message.reply_text(f"Phát hiện trạng thái: {STATE.lock_type}")
+                if "login" in driver.current_url:
+                    try:
+                        fill_password(driver, STATE.fb_password)
+                    except Exception as e:
+                        logger.error(f"Lỗi nhập mật khẩu: {e}")
+                        await update.message.reply_text(f"Lỗi nhập mật khẩu: {e}")
+                if STATE.lock_type in ["checkpoint", "temp_blocked", "suspended"]:
+                    handle_checkpoint_flow(driver)
+                elif STATE.lock_type == "forgot_password":
+                    handle_forgot_password_flow(driver)
+                elif STATE.lock_type == "hacked_recovery":
+                    handle_hacked_flow(driver)
+                elif STATE.lock_type in ["disabled", "perm_disabled"]:
+                    handle_disabled_flow(driver)
+                else:
+                    handle_forgot_password_flow(driver)
+                await update.message.reply_text(f"Đang ở bước: {STATE.current_step} | Chờ: {STATE.waiting_for}")
+            except Exception as e:
+                logger.error(f"Lỗi xử lý: {e}")
+                await update.message.reply_text(f"Lỗi xử lý: {e}")
         # Nhập mã xác nhận
         elif STATE.waiting_for in ["code", "email_code"]:
             if STATE.driver is not None:
