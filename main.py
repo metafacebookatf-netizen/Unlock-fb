@@ -251,80 +251,98 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Đã huỷ toàn bộ phiên.")
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
+    text = update.message.text.strip()
 
+    # ƯU TIÊN 1: Đang chờ số điện thoại
+    if STATE.waiting_for == "ask_contact":
+        STATE.fb_contact = text
+        STATE.waiting_for = "ask_password"
+        await update.message.reply_text("Đã nhận. Gửi mật khẩu Facebook.")
+        return
+
+    # ƯU TIÊN 2: Đang chờ mật khẩu — bắt đầu xử lý
+    if STATE.waiting_for == "ask_password":
+        STATE.fb_password = text
+        STATE.waiting_for = None
+        await update.message.reply_text("Đang khởi động trình duyệt...")
+        try:
+            driver = get_driver()
+            goto_login_recovery(driver)
+            fill_contact(driver, STATE.fb_contact)
+            time.sleep(2)
+            STATE.lock_type = detect_lock_type(driver)
+            await update.message.reply_text(f"Phát hiện trạng thái: {STATE.lock_type}")
+            if "login" in driver.current_url:
+                try:
+                    fill_password(driver, STATE.fb_password)
+                except Exception as e:
+                    logger.error(f"Lỗi nhập mật khẩu: {e}")
+                    await update.message.reply_text(f"Lỗi nhập mật khẩu: {e}")
+            if STATE.lock_type in ["checkpoint", "temp_blocked", "suspended"]:
+                handle_checkpoint_flow(driver)
+            elif STATE.lock_type == "forgot_password":
+                handle_forgot_password_flow(driver)
+            elif STATE.lock_type == "hacked_recovery":
+                handle_hacked_flow(driver)
+            elif STATE.lock_type in ["disabled", "perm_disabled"]:
+                handle_disabled_flow(driver)
+            else:
+                handle_forgot_password_flow(driver)
+            await update.message.reply_text(f"Đang ở bước: {STATE.current_step} | Chờ: {STATE.waiting_for}")
+        except Exception as e:
+            logger.error(f"Lỗi xử lý: {e}")
+            await update.message.reply_text(f"Lỗi xử lý: {e}")
+        return
+
+    # ƯU TIÊN 3: Đang chờ mã xác nhận (2FA hoặc email)
+    if STATE.waiting_for in ["code", "email_code"]:
+        if STATE.driver is not None:
+            url = STATE.driver.current_url
+            if "checkpoint" in url:
+                handle_mfa_code(STATE.driver, text)
+            else:
+                handle_email_code(STATE.driver, text)
+        await update.message.reply_text("Đã nhập mã.")
+        time.sleep(3)
+        STATE.log_step("Đã xử lý mã, kiểm tra trạng thái mới")
+        STATE.lock_type = detect_lock_type(STATE.driver)
+        await update.message.reply_text(f"Trạng thái mới: {STATE.lock_type}")
+        return
+
+    # ƯU TIÊN 4: Đang chờ xác nhận danh tính
+    if STATE.waiting_for == "confirm":
+        if text.lower() in ["có", "yes", "đúng", "ok"]:
+            try:
+                btn = STATE.driver.find_element(By.XPATH, "//button[contains(.,'Đây là tôi') or contains(.,'This is me')]")
+                btn.click()
+                STATE.log_step("Đã xác nhận danh tính")
+                await update.message.reply_text("Đã xác nhận.")
+            except Exception as e:
+                logger.error(f"Lỗi xác nhận: {e}")
+                await update.message.reply_text(f"Lỗi xác nhận: {e}")
+        else:
+            await update.message.reply_text("Gõ 'có' để xác nhận danh tính.")
+        return
+
+    # ƯU TIÊN 5: Các lệnh nút bấm
     if text == "🔓 Mở khoá Facebook":
         await cmd_unlock(update, context)
-    elif text == "📋 Trạng thái":
+        return
+    if text == "📋 Trạng thái":
         await cmd_status(update, context)
-    elif text == "📸 Chụp màn hình":
+        return
+    if text == "📸 Chụp màn hình":
         await cmd_screenshot(update, context)
-    elif text == "📄 Upload giấy tờ":
+        return
+    if text == "📄 Upload giấy tờ":
         await cmd_upload_id(update, context)
-    elif text == "❌ Huỷ":
+        return
+    if text == "❌ Huỷ":
         await cmd_cancel(update, context)
-    else:
-        # Nhận số điện thoại/email
-        if STATE.waiting_for == "ask_contact":
-            STATE.fb_contact = text.strip()
-            STATE.waiting_for = "ask_password"
-            await update.message.reply_text("Đã nhận. Gửi mật khẩu Facebook.")
-        # Nhận mật khẩu và bắt đầu
-        elif STATE.waiting_for == "ask_password":
-            STATE.fb_password = text.strip()
-            STATE.waiting_for = None
-            await update.message.reply_text("Đang khởi động trình duyệt...")
-            try:
-                driver = get_driver()
-                goto_login_recovery(driver)
-                fill_contact(driver, STATE.fb_contact)
-                time.sleep(2)
-                STATE.lock_type = detect_lock_type(driver)
-                await update.message.reply_text(f"Phát hiện trạng thái: {STATE.lock_type}")
-                if "login" in driver.current_url:
-                    try:
-                        fill_password(driver, STATE.fb_password)
-                    except Exception as e:
-                        logger.error(f"Lỗi nhập mật khẩu: {e}")
-                        await update.message.reply_text(f"Lỗi nhập mật khẩu: {e}")
-                if STATE.lock_type in ["checkpoint", "temp_blocked", "suspended"]:
-                    handle_checkpoint_flow(driver)
-                elif STATE.lock_type == "forgot_password":
-                    handle_forgot_password_flow(driver)
-                elif STATE.lock_type == "hacked_recovery":
-                    handle_hacked_flow(driver)
-                elif STATE.lock_type in ["disabled", "perm_disabled"]:
-                    handle_disabled_flow(driver)
-                else:
-                    handle_forgot_password_flow(driver)
-                await update.message.reply_text(f"Đang ở bước: {STATE.current_step} | Chờ: {STATE.waiting_for}")
-            except Exception as e:
-                logger.error(f"Lỗi xử lý: {e}")
-                await update.message.reply_text(f"Lỗi xử lý: {e}")
-        # Nhập mã xác nhận
-        elif STATE.waiting_for in ["code", "email_code"]:
-            if STATE.driver is not None:
-                url = STATE.driver.current_url
-                if "checkpoint" in url:
-                    handle_mfa_code(STATE.driver, text)
-                else:
-                    handle_email_code(STATE.driver, text)
-            await update.message.reply_text("Đã nhập mã.")
-            time.sleep(3)
-            STATE.log_step("Đã xử lý mã, kiểm tra trạng thái mới")
-            STATE.lock_type = detect_lock_type(STATE.driver)
-            await update.message.reply_text(f"Trạng thái mới: {STATE.lock_type}")
-        # Xác nhận danh tính
-        elif STATE.waiting_for == "confirm":
-            if text.lower() == "có" or text == "Yes":
-                try:
-                    btn = STATE.driver.find_element(By.XPATH, "//button[contains(.,'Đây là tôi') or contains(.,'This is me')]")
-                    btn.click()
-                    STATE.log_step("Đã xác nhận danh tính")
-                except:
-                    pass
-        else:
-            await update.message.reply_text("Lệnh không hợp lệ. Dùng /help hoặc chọn nút.")
+        return
+
+    # Không khớp gì cả
+    await update.message.reply_text("Lệnh không hợp lệ. Dùng /help hoặc chọn nút.")
 
 # ============ FLASK WEB SERVER ============
 app = Flask(__name__)
