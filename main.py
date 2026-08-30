@@ -12,10 +12,15 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from pyvirtualdisplay import Display
 from flask import Flask
 import threading
+import subprocess
 
 # ============ CẤU HÌNH ============
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "THAY_BOT_TOKEN_O_DAY")
 SESSION_FILE = "fb_session.pkl"
+CHROME_BIN = os.environ.get("CHROME_BIN", "/usr/bin/chromium")
+CHROMEDRIVER_BIN = os.environ.get("CHROMEDRIVER_BIN", "/usr/bin/chromedriver")
+CAPTCHA_DIR = "captchas"
+os.makedirs(CAPTCHA_DIR, exist_ok=True)
 
 # ============ LOGGING ============
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
@@ -32,6 +37,8 @@ class BotState:
         self.session_dir = "session"
         self.fb_contact = None
         self.fb_password = None
+        self.captcha_solution = None
+        self.last_captcha_path = None
         os.makedirs(self.session_dir, exist_ok=True)
 
     def log_step(self, step):
@@ -57,7 +64,16 @@ def get_driver():
         opts.add_argument("--no-default-browser-check")
         opts.add_argument("--disable-notifications")
         opts.add_argument("--disable-popup-blocking")
-        driver = uc.Chrome(options=opts, user_data_dir=STATE.session_dir)
+        opts.add_argument("--disable-setuid-sandbox")
+        opts.add_argument("--disable-software-rasterizer")
+        opts.add_argument("--disable-features=VizDisplayCompositor")
+        # Chỉ định đường dẫn ChromeDriver và Chrome có sẵn trong container
+        driver = uc.Chrome(
+            options=opts,
+            user_data_dir=STATE.session_dir,
+            driver_executable_path=CHROMEDRIVER_BIN,
+            browser_executable_path=CHROME_BIN
+        )
         driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
             "source": """
             Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
@@ -69,7 +85,41 @@ def get_driver():
         return driver
     except Exception as e:
         logger.error(f"Lỗi khởi động driver: {e}")
-        raise RuntimeError(f"Không thể khởi động trình duyệt: {e}")
+        # Fallback: thử tìm đường dẫn khác
+        try:
+            alt_chrome = "/usr/bin/chromium-browser"
+            alt_driver = "/usr/bin/chromedriver"
+            driver = uc.Chrome(
+                options=opts,
+                user_data_dir=STATE.session_dir,
+                driver_executable_path=alt_driver,
+                browser_executable_path=alt_chrome
+            )
+            STATE.driver = driver
+            return driver
+        except Exception as e2:
+            logger.error(f"Lỗi fallback driver: {e2}")
+            raise RuntimeError(f"Không thể khởi động trình duyệt: {e}")
+
+# ============ CAPTCHA HANDLING ============
+def check_for_captcha(driver):
+    """Kiểm tra và chụp captcha nếu có."""
+    try:
+        # Kiểm tra các selector thường dùng cho captcha
+        captcha_iframes = driver.find_elements(By.TAG_NAME, "iframe")
+        for iframe in captcha_iframes:
+            if "captcha" in (iframe.get_attribute("src") or "").lower():
+                driver.switch_to.frame(iframe)
+                # Chụp màn hình khung captcha
+                path = os.path.join(CAPTCHA_DIR, f"captcha_{time.time()}.png")
+                driver.save_screenshot(path)
+                STATE.last_captcha_path = path
+                STATE.waiting_for = "captcha_solution"
+                driver.switch_to.default_content()
+                return True
+    except Exception as e:
+        logger.error(f"Lỗi kiểm tra captcha: {e}")
+    return False
 
 # ============ DETECT LOCK TYPE ============
 def detect_lock_type(driver):
@@ -278,6 +328,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception as e:
                     logger.error(f"Lỗi nhập mật khẩu: {e}")
                     await update.message.reply_text(f"Lỗi nhập mật khẩu: {e}")
+            # Kiểm tra captcha ngay sau khi load
+            if check_for_captcha(driver):
+                with open(STATE.last_captcha_path, "rb") as f:
+                    await update.message.reply_photo(f, caption="Có captcha. Gửi mã bạn thấy để bot tiếp tục.")
+                    STATE.waiting_for = "captcha_solution"
+                    return
             if STATE.lock_type in ["checkpoint", "temp_blocked", "suspended"]:
                 handle_checkpoint_flow(driver)
             elif STATE.lock_type == "forgot_password":
@@ -307,9 +363,42 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         STATE.log_step("Đã xử lý mã, kiểm tra trạng thái mới")
         STATE.lock_type = detect_lock_type(STATE.driver)
         await update.message.reply_text(f"Trạng thái mới: {STATE.lock_type}")
+        # Kiểm tra captcha sau khi nhập mã
+        if check_for_captcha(STATE.driver):
+            with open(STATE.last_captcha_path, "rb") as f:
+                await update.message.reply_photo(f, caption="Có captcha mới. Gửi mã bạn thấy.")
+                STATE.waiting_for = "captcha_solution"
         return
 
-    # ƯU TIÊN 4: Đang chờ xác nhận danh tính
+    # ƯU TIÊN 4: Đang chờ giải captcha
+    if STATE.waiting_for == "captcha_solution":
+        # Gửi mã vào captcha
+        try:
+            # Tìm ô nhập captcha
+            inputs = STATE.driver.find_elements(By.TAG_NAME, "input")
+            for input_el in inputs:
+                if input_el.is_displayed():
+                    input_el.send_keys(text)
+                    break
+            # Bấm nút submit
+            buttons = STATE.driver.find_elements(By.TAG_NAME, "button")
+            for btn in buttons:
+                if "Continue" in btn.text or "Tiếp tục" in btn.text or "Submit" in btn.text:
+                    btn.click()
+                    break
+            STATE.waiting_for = None
+            STATE.log_step("Đã gửi captcha")
+            await update.message.reply_text("Đã gửi captcha.")
+            time.sleep(2)
+            # Tiếp tục kiểm tra trạng thái
+            STATE.lock_type = detect_lock_type(STATE.driver)
+            await update.message.reply_text(f"Trạng thái mới: {STATE.lock_type}")
+        except Exception as e:
+            logger.error(f"Lỗi xử lý captcha: {e}")
+            await update.message.reply_text(f"Lỗi xử lý captcha: {e}")
+        return
+
+    # ƯU TIÊN 5: Đang chờ xác nhận danh tính
     if STATE.waiting_for == "confirm":
         if text.lower() in ["có", "yes", "đúng", "ok"]:
             try:
@@ -324,7 +413,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Gõ 'có' để xác nhận danh tính.")
         return
 
-    # ƯU TIÊN 5: Các lệnh nút bấm
+    # ƯU TIÊN 6: Các lệnh nút bấm
     if text == "🔓 Mở khoá Facebook":
         await cmd_unlock(update, context)
         return
